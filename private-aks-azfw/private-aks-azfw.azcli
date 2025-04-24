@@ -1,0 +1,276 @@
+# reference architecture https://docs.microsoft.com/en-us/azure/aks/limit-egress-traffic#deploy-a-public-service
+# A private AKS behind Azure Firewall.
+
+# Variables
+rg='aks-azfw'
+location='westeurope'
+hub_vnet_name='hub'
+hub_vnet_address='10.1.0.0/16'
+hub_fw_subnet_name='AzureFirewallSubnet'
+hub_fw_subnet_address='10.1.0.0/24'
+aks_vnet_name='aks'
+aks_vnet_address='10.0.0.0/16'
+aks_system_subnet_name='SystemSubnet'
+aks_system_subnet_address='10.0.0.0/21'
+aks_user_subnet_name='UserSubnet'
+aks_user_subnet_address='10.0.16.0/20'
+aks_vm_subnet_name='VMSubnet'
+aks_vm_subnet_address='10.0.8.0/21'
+aks_name='akscluster'
+aks_jump_vm_name='jump'
+vm_image=$(az vm image list -l $location -p Canonical -s 20_04-lts --all --query "[?offer=='0001-com-ubuntu-server-focal'].urn" -o tsv | sort -u | tail -n 1)
+
+
+jump_init_file=~/jump_init.txt
+cat <<EOF > $jump_init_file
+#cloud-config
+runcmd:
+  - echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+  - apt-get update -y && apt-get dist-upgrade -y && apt autoremove -y
+  - sudo curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl &&
+  - chmod +x ./kubectl &&
+  - mv ./kubectl /usr/local/bin/kubectl
+  - sudo curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 &&
+  - chmod 700 get_helm.sh &&
+  - ./get_helm.sh
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+EOF
+
+# resource group
+echo -e "\e[1;36mCreating Resource Group $rg....\e[0m"
+az group create --location $location -n $rg -o none
+
+# AKS Managed Identity
+az identity create -g $rg -n $aks_name-identity -o none
+aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv)
+
+# vnets
+echo -e "\e[1;36mCreating VNet $hub_vnet_name....\e[0m"
+az network vnet create -g $rg -n $hub_vnet_name --address-prefixes $hub_vnet_address --subnet-name $hub_fw_subnet_name --subnet-prefixes $hub_fw_subnet_address -o none
+echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
+az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address --subnet-name $aks_system_subnet_name --subnet-prefixes $aks_system_subnet_address -o none
+az network vnet subnet create -g $rg -n $aks_user_subnet_name --address-prefixes $aks_user_subnet_address --vnet-name $aks_vnet_name -o none
+az network vnet subnet create -g $rg -n $aks_vm_subnet_name --address-prefixes $aks_vm_subnet_address --vnet-name $aks_vnet_name -o none
+
+# vnet peering
+echo -e "\e[1;36mCreating VNet Peering between $hub_vnet_name and $aks_vnet_name....\e[0m"
+az network vnet peering create -g $rg -n to-$aks_vnet_name --remote-vnet $aks_vnet_name --vnet-name $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+az network vnet peering create -g $rg -n to-$hub_vnet_name --remote-vnet $hub_vnet_name --vnet-name $aks_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-logAnalytics....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $aks_name-logAnalytics -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv)
+
+# nsg
+echo -e "\e[1;36mCreating Jump box NSG $aks_jump_vm_name-nsg....\e[0m"
+myip=$(curl -s https://ifconfig.co)
+az network nsg create -g $rg -n $aks_jump_vm_name-nsg -o none
+az network nsg rule create -g $rg -n AllowSSH --nsg-name $aks_jump_vm_name-nsg --priority 200 --access Allow --description "Allow ssh from $myip" --destination-address-prefixes $aks_vm_subnet_address --destination-port-ranges 22 --direction Inbound --protocol Tcp --source-address-prefixes $myip --source-port-ranges "*" -o none
+
+# jump vm
+admin_username=$(whoami)
+echo -e "\e[1;36mCreating Jump box $aks_jump_vm_name....\e[0m"
+az network public-ip create -g $rg -n $aks_jump_vm_name-pubip --allocation-method Static --sku Basic -o none
+az network nic create -g $rg -n $aks_jump_vm_name-nic --vnet-name $aks_vnet_name --subnet $aks_vm_subnet_name --public-ip-address $aks_jump_vm_name-pubip --network-security-group $aks_jump_vm_name-nsg -o none
+az vm create -g $rg -n $aks_jump_vm_name --nics $aks_jump_vm_name-nic --os-disk-name $aks_jump_vm_name-osdisk --image $vm_image --admin-username $admin_username --custom-data $jump_init_file  --generate-ssh-keys --no-wait -o none
+jump_vm_pubip=$(az network public-ip show -g $rg -n $aks_jump_vm_name-pubip --query ipAddress -o tsv)
+
+# aks cluster
+admin_username=$(whoami)
+echo -e "\e[1;36mCreating AKS Cluster $aks_name....\e[0m"
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+aks_user_subnet_id=$(az network vnet subnet show -g $rg -n $aks_user_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+az aks create -g $rg -n $aks_name --enable-addons monitoring --workspace-resource-id $log_analytics_ws_id --enable-managed-identity --assign-identity $aks_identity_id --enable-private-cluster --nodepool-name systempool --node-vm-size Standard_b2ms --generate-ssh-keys --admin-username $admin_username --docker-bridge-address "172.17.0.1/16" --network-plugin azure --vnet-subnet-id $aks_system_subnet_id --node-count 1 --service-cidr "10.2.0.0/24" --dns-service-ip "10.2.0.10" -o none
+az aks command invoke -g $rg -n $aks_name --command "kubectl get pods -n kube-system"
+
+# user node pool
+echo -e "\e[1;36mAdding user node pool to AKS Cluster $aks_name....\e[0m"
+az aks nodepool add --cluster-name $aks_name -g $rg -n userpool --priority Spot --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --node-vm-size Standard_D2_v4 --vnet-subnet-id $aks_user_subnet_id --mode User --spot-max-price 0.0300 -o none
+# Give AKS Managed Identity Access on the RG and Node RG
+identityClientId=$(az identity show -g $rg -n $aks_name-identity --query clientId -o tsv)
+ResourceGroupID=$(az group show -n $rg --query id -o tsv)
+subscriptionId=$(az account show --query 'id' -o tsv)
+AKSNodeRG=$(az aks list -g $rg --query '[0].nodeResourceGroup' -o tsv)
+az role assignment create --assignee $identityClientId --role "Contributor" --scope $ResourceGroupID -o none
+az role assignment create --assignee $identityClientId  --role "Contributor" --scope /subscriptions/$subscriptionId/resourceGroups/$AKSNodeRG -o none
+
+## Deploy app
+# An app with internal load balancer
+voting_file=~/voting.yml
+cat <<EOF > $voting_file
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azure-vote-back
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azure-vote-back
+  template:
+    metadata:
+      labels:
+        app: azure-vote-back
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/scalesetpriority: spot
+      tolerations:
+      - key: "kubernetes.azure.com/scalesetpriority"
+        operator: "Equal"
+        value: "spot"
+        effect: "NoSchedule"
+      containers:
+      - name: azure-vote-back
+        image: mcr.microsoft.com/oss/bitnami/redis:6.0.8
+        env:
+        - name: ALLOW_EMPTY_PASSWORD
+          value: "yes"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        ports:
+        - containerPort: 6379
+          name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: azure-vote-back
+spec:
+  ports:
+  - port: 6379
+  selector:
+    app: azure-vote-back
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azure-vote-front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azure-vote-front
+  template:
+    metadata:
+      labels:
+        app: azure-vote-front
+    spec:
+      nodeSelector:
+        kubernetes.azure.com/scalesetpriority: spot
+      tolerations:
+      - key: "kubernetes.azure.com/scalesetpriority"
+        operator: "Equal"
+        value: "spot"
+        effect: "NoSchedule"
+      containers:
+      - name: azure-vote-front
+        image: mcr.microsoft.com/azuredocs/azure-vote-front:v1
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        ports:
+        - containerPort: 80
+        env:
+        - name: REDIS
+          value: "azure-vote-back"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: azure-vote-front
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+  selector:
+    app: azure-vote-front
+EOF
+
+##ssh into the jump vm and run the following commands:
+echo -e "\e[1;36mSSH into jump box and then deploying an application into the AKS Cluster....\e[0m"
+username=$(whoami)
+scp -o StrictHostKeyChecking=no $voting_file $jump_vm_pubip:/home/$username
+echo -e "\e[1;36mLogin to your Azure Subscription where this environment was created....\e[0m"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "az login"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "az account set --subscription $(az account list --query "[?isDefault].id" -o tsv)"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "az aks get-credentials -g $rg -n $aks_name"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl apply -f /home/$username/voting.yml"
+sleep 90
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl get deployment,pod,svc"
+votingapp_ip=$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl get svc azure-vote-front -o jsonpath='{.status.loadBalancer.ingress[*].ip}'")
+
+
+# azure firewall and policy
+echo -e "\e[1;36mCreating Azure Firewall Policy....\e[0m"
+azfw_policy_name=azfirewall-policy
+az extension add -n azure-firewall
+az extension update -n azure-firewall
+az network firewall policy create -n $azfw_policy_name -g $rg -o none
+# Azure Firewall Rule Collection Group
+az network firewall policy rule-collection-group create -n AksEgressPolicyRuleCollectionGroup --policy-name $azfw_policy_name -g $rg --priority 500 -o none
+# Azure Firewall Application Rules
+az network firewall policy rule-collection-group collection add-filter-collection -g $rg -n AllowApplicationRules --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --action Allow --rule-name AllowAzureGlobalFQDNs --collection-priority 500 --rule-type ApplicationRule  --protocols https=443 --source-addresses "*" --target-fqdns "*.hcp.$location.azmk8s.io" "mcr.microsoft.com" "*.data.mcr.microsoft.com" "management.azure.com" "login.microsoftonline.com" "packages.microsoft.com" "acs-mirror.azureedge.net" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowOptRecomFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 --source-addresses "*" --target-fqdns "security.ubuntu.com" "azure.archive.ubuntu.com" "nchangelogs.ubuntu.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowGPUFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "nvidia.github.io" "us.download.nvidia.com" "download.docker.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowReqWinCluster --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 https=443 --source-addresses "*" --target-fqdns "onegetcdn.azureedge.net" "go.microsoft.com" "*.mp.microsoft.com" "www.msftconnecttest.com" "ctldl.windowsupdate.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowDefender --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "login.microsoftonline.com" "*.ods.opinsights.azure.com" "*.oms.opinsights.azure.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowCSISecretStore --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "vault.azure.net	" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowAzurePolicy --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "data.policy.core.windows.net" "store.policy.core.windows.net" "dc.services.visualstudio.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowClusterExtensions --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses '*' --target-fqdns "$location.dp.kubernetesconfiguration.azure.com" "mcr.microsoft.com" "*.data.mcr.microsoft.com" -o none
+# Azure Firewall Network Rules
+az network firewall policy rule-collection-group collection add-filter-collection -n AllowNetworkRules -g $rg --policy-name $azfw_policy_name --rcg-name AksEgressPolicyRuleCollectionGroup --action Allow  --rule-name AllowAzureGlobalUDP --collection-priority 400 --rule-type NetworkRule --source-addresses "*" --ip-protocols udp --destination-addresses "*" --destination-ports "1194" "123" "53" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAzureGlobalTCP --rule-type NetworkRule --dest-addr "*" --destination-ports "9000" "443" --ip-protocols TCP --source-addresses "*" -o none
+# Network rule to allow HTTP traffic to App running on AKS
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowHTTPToVotingApp --rule-type NetworkRule --dest-addr $aks_vnet_address --destination-ports 80 --ip-protocols TCP --source-addresses "*" -o none
+
+
+
+echo -e "\e[1;36mCreating Azure Firewall ....\e[0m"
+azfw_name='azfirewall'
+az network public-ip create -n $azfw_name-pubip -g $rg --allocation-method static --sku standard --tags $tag -o none
+az network firewall create -n $azfw_name -g $rg --sku AZFW_VNet --firewall-policy $azfw_policy_name --tier Premium --tags $tag -o none
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n $azfw_name-logs --resource $azfw_id --workspace $log_analytics_ws_id --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' --logs '[{"categoryGroup": "allLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'  -o none
+az network firewall ip-config create --firewall-name $azfw_name -g $rg --vnet-name $hub_vnet_name --public-ip-address $azfw_name-pubip -n azfwconfig -o none
+az network firewall update -n $azfw_name -g $rg -o none
+hub_fw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query ipConfigurations[].privateIpAddress -o tsv)
+hub_fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress -o tsv)
+
+# Add DNAT Rule to Allow HTTP traffic to the app running on AKS
+echo -e "\e[1;36mCreating a DNAT rule for the application running on the AKS Cluster ....\e[0m"
+az network firewall policy rule-collection-group collection add-nat-collection -n NATRules -g $rg --policy-name $azfw_policy_name --rcg-name AksEgressPolicyRuleCollectionGroup --action DNAT --rule-name VotingAppNAT --collection-priority 300 --source-addresses "*" --destination-addresses $hub_fw_public_ip --destination-ports 80 --translated-address $votingapp_ip --translated-port 80 --ip-protocols tcp -o none
+
+
+#Deploy Azure Monitor Workbook for Azure Firewall
+echo -e "\e[1;36mDeploying Azure Monitor Workbook for Azure Firewall....\e[0m"
+guid=$(curl -s https://www.uuidgenerator.net/api/version1)
+templateUri="https://raw.githubusercontent.com/Azure/Azure-Network-Security/master/Azure%20Firewall/Workbook%20-%20Azure%20Firewall%20Monitor%20Workbook/Azure%20Firewall_ARM.json"
+az group deployment create -g $rg -n deployAzMonitorForFW --template-uri $templateUri -p "workbookDisplayName=$azfw_name-workbook" 'workbookType=workbook' "workbookSourceId=$log_analytics_ws_id" "workbookId=$guid" -o none
+
+
+
+# route table
+echo -e "\e[1;36mCreating Route table and attach to AKS system and user subnets....\e[0m"
+az network route-table create -g $rg -n $aks_name-route --disable-bgp-route-propagation true -o none
+az network route-table route create -g $rg -n ToAnything --route-table-name $aks_name-route --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
+az network route-table route create -g $rg -n ToFW-PubIP --route-table-name $aks_name-route --address-prefix $hub_fw_public_ip/32 --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_system_subnet_name --route-table $aks_name-route -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_user_subnet_name --route-table $aks_name-route -o none
+
+# clean up files
+rm $voting_file $jump_init_file
+
+# message
+echo -e "\e[1;36mAccess the following URL to browse the voting app running on the AKS http://$hub_fw_public_ip ....\e[0m"

@@ -1,0 +1,188 @@
+# Application Gateway before Azure Firewall. AKS has AGIC addon installed and behind AppGW
+# Variables
+rg='aks-appgw-agic-fw'
+location='uaenorth'
+hub_vnet_name='hub'
+hub_vnet_address='10.1.0.0/16'
+hub_fw_subnet_name='AzureFirewallSubnet'
+hub_fw_subnet_address='10.1.0.0/24'
+hub_appgw_subnet_name='AppGwSubnet'
+hub_appgw_subnet_address='10.1.1.0/24'
+
+aks_vnet_name='aks'
+aks_vnet_address='10.0.0.0/16'
+aks_system_subnet_name='SystemSubnet'
+aks_system_subnet_address='10.0.0.0/21'
+aks_vm_subnet_name='VMSubnet'
+aks_vm_subnet_address='10.0.8.0/21'
+aks_name='akscluster'
+vm_size=Standard_b2ms
+
+admin_username=$(whoami)
+
+# resource group
+echo -e "\e[1;36mCreating Resource Group $rg....\e[0m"
+az group create --location $location -n $rg -o none
+
+# AKS Managed Identity
+echo -e "\e[1;36mCreating AKS Managed Identity $aks_name-identity....\e[0m"
+az identity create -g $rg -n $aks_name-identity -o none
+aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv)
+
+# Hub VNet
+echo -e "\e[1;36mCreating VNet $hub_vnet_name....\e[0m"
+az network vnet create -g $rg -n $hub_vnet_name --address-prefixes $hub_vnet_address --subnet-name $hub_fw_subnet_name --subnet-prefixes $hub_fw_subnet_address -o none
+az network vnet subnet create -g $rg -n $hub_appgw_subnet_name --address-prefixes $hub_appgw_subnet_address --vnet-name $hub_vnet_name -o none
+
+# Aks VNet
+echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
+az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address --subnet-name $aks_system_subnet_name --subnet-prefixes $aks_system_subnet_address -o none
+az network vnet subnet create -g $rg -n $aks_vm_subnet_name --address-prefixes $aks_vm_subnet_address --vnet-name $aks_vnet_name -o none
+
+# VNet Peering between hub and spoke VNet
+az network vnet peering create -g $rg -n $hub_vnet_name-to-$aks_vnet_name --remote-vnet $aks_vnet_name --vnet-name $hub_vnet_name --allow-forwarded-traffic --allow-vnet-access -o none
+az network vnet peering create -g $rg -n $aks_vnet_name-to-$hub_vnet_name --remote-vnet $hub_vnet_name --vnet-name $aks_vnet_name --allow-forwarded-traffic --allow-vnet-access -o none
+
+# app gw
+appgw_name="aks-appgw"
+echo -e "\e[1;36mCreating Application Gateway $appgw_name....\e[0m"
+az network public-ip create -g $rg -n $appgw_name-pubip --allocation-method Static --sku Standard -o none
+az network application-gateway create -n $appgw_name -g $rg --priority 10 --public-ip-address $appgw_name-pubip --sku Standard_v2 --vnet-name $hub_vnet_name --subnet $hub_appgw_subnet_name --no-wait
+
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-logAnalytics....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $aks_name-logAnalytics -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv)
+
+# aks cluster
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons monitoring --workspace-resource-id $log_analytics_ws_id --enable-managed-identity --assign-identity $aks_identity_id --nodepool-name systempool --node-vm-size Standard_b2ms --generate-ssh-keys --admin-username $admin_username --docker-bridge-address "172.17.0.1/16" --network-plugin azure --vnet-subnet-id $aks_system_subnet_id --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --service-cidr "10.2.0.0/24" --dns-service-ip "10.2.0.10" -o none
+
+# Enable ingress-appgw
+echo -e "\e[1;36m\nEnabling ingress-appgw add-on on $aks_name....\e[0m"
+appgwId=$(az network application-gateway show -n $appgw_name -g $rg -o tsv --query "id")
+az aks enable-addons -n $aks_name -g $rg -a "ingress-appgw" --appgw-id $appgwId -o none
+
+# # Get appgw public IP address
+appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv) && echo "$appgw_name public IP address: $appgw_pubip"
+
+# Deploy apps to AKS Cluster
+echo -e "\e[1;36mDeploying apps on $aks_name with AGIC ingress....\e[0m"
+az aks get-credentials -g $rg -n $aks_name --admin
+
+# Deploy apps
+##########
+# APP #1 #
+##########
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aspnetapp
+  labels:
+    app: aspnetapp
+spec:
+  containers:
+  - image: "mcr.microsoft.com/dotnet/core/samples:aspnetapp"
+    name: aspnetapp-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aspnetapp-svc
+spec:
+  selector:
+    app: aspnetapp
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aspnetapp-ing
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "aspnetapp.$appgw_pubip.nip.io"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: aspnetapp-svc
+            port: 
+              number: 80
+EOF
+
+
+kubectl get deploy,pod,svc,ingress
+sleep 20
+echo "Try to access the following sites: http://aspnetapp.$appgw_pubip.nip.io/"
+
+# azure firewall and policy
+echo -e "\e[1;36mCreating Azure Firewall Policy....\e[0m"
+azfw_policy_name=azfirewall-policy
+az extension add -n azure-firewall
+az extension update -n azure-firewall
+az network firewall policy create -n $azfw_policy_name -g $rg -o none
+# Azure Firewall Rule Collection Group
+az network firewall policy rule-collection-group create -n AksEgressPolicyRuleCollectionGroup --policy-name $azfw_policy_name -g $rg --priority 500 -o none
+# Azure Firewall Application Rules
+az network firewall policy rule-collection-group collection add-filter-collection -g $rg -n AllowApplicationRules --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --action Allow --rule-name AllowAzureGlobalFQDNs --collection-priority 500 --rule-type ApplicationRule  --protocols https=443 --source-addresses "*" --target-fqdns "*.hcp.$location.azmk8s.io" "mcr.microsoft.com" "*.data.mcr.microsoft.com" "management.azure.com" "login.microsoftonline.com" "packages.microsoft.com" "acs-mirror.azureedge.net" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowOptRecomFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 --source-addresses "*" --target-fqdns "security.ubuntu.com" "azure.archive.ubuntu.com" "nchangelogs.ubuntu.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowGPUFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "nvidia.github.io" "us.download.nvidia.com" "download.docker.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowReqWinCluster --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 https=443 --source-addresses "*" --target-fqdns "onegetcdn.azureedge.net" "go.microsoft.com" "*.mp.microsoft.com" "www.msftconnecttest.com" "ctldl.windowsupdate.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowDefender --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "login.microsoftonline.com" "*.ods.opinsights.azure.com" "*.oms.opinsights.azure.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowCSISecretStore --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "vault.azure.net	" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowAzurePolicy --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "data.policy.core.windows.net" "store.policy.core.windows.net" "dc.services.visualstudio.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowClusterExtensions --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses '*' --target-fqdns "$location.dp.kubernetesconfiguration.azure.com" "mcr.microsoft.com" "*.data.mcr.microsoft.com" -o none
+# Azure Firewall Network Rules
+az network firewall policy rule-collection-group collection add-filter-collection -n AllowNetworkRules -g $rg --policy-name $azfw_policy_name --rcg-name AksEgressPolicyRuleCollectionGroup --action Allow  --rule-name AllowAzureGlobalUDP --collection-priority 400 --rule-type NetworkRule --source-addresses "*" --ip-protocols udp --destination-addresses "*" --destination-ports "1194" "123" "53" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAzureGlobalTCP --rule-type NetworkRule --dest-addr "*" --destination-ports "9000" "443" --ip-protocols TCP --source-addresses "*" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAKStoAppGW --rule-type NetworkRule --dest-addr $hub_appgw_subnet_address --destination-ports '*' --ip-protocols Tcp --source-addresses $aks_system_subnet_address -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAppGWtoAKS --rule-type NetworkRule --dest-addr $aks_system_subnet_address --destination-ports '*' --ip-protocols Tcp --source-addresses $hub_appgw_subnet_address -o none
+
+
+echo -e "\e[1;36mCreating Azure Firewall ....\e[0m"
+azfw_name='azfirewall'
+az network public-ip create -n $azfw_name-pubip -g $rg --allocation-method static --sku standard --tags $tag -o none
+az network firewall create -n $azfw_name -g $rg --sku AZFW_VNet --firewall-policy $azfw_policy_name --tier Premium --tags $tag -o none
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n $azfw_name-logs --resource $azfw_id --workspace $log_analytics_ws_id --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'  -o none
+az network firewall ip-config create --firewall-name $azfw_name -g $rg --vnet-name $hub_vnet_name --public-ip-address $azfw_name-pubip -n azfwconfig -o none
+az network firewall update -n $azfw_name -g $rg -o none
+hub_fw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query ipConfigurations[].privateIpAddress -o tsv)
+hub_fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress -o tsv)
+
+#Deploy Azure Monitor Workbook for Azure Firewall
+echo -e "\e[1;36mDeploying Azure Monitor Workbook for Azure Firewall....\e[0m"
+guid=$(curl -s https://www.uuidgenerator.net/api/version1)
+templateUri="https://raw.githubusercontent.com/Azure/Azure-Network-Security/master/Azure%20Firewall/Workbook%20-%20Azure%20Firewall%20Monitor%20Workbook/Azure%20Firewall_ARM.json"
+az group deployment create -g $rg -n deployAzMonitorForFW --template-uri $templateUri -p "workbookDisplayName=$azfw_name-workbook" 'workbookType=workbook' "workbookSourceId=$log_analytics_ws_id" "workbookId=$guid" -o none
+
+# aks route table
+echo -e "\e[1;36mCreating Route table and attach to AKS system....\e[0m"
+az network route-table create -g $rg -n $aks_name-route --disable-bgp-route-propagation true -o none
+az network route-table route create -g $rg -n ToAnything --route-table-name $aks_name-route --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
+az network route-table route create -g $rg -n ToAppGW --route-table-name $aks_name-route --address-prefix $hub_appgw_subnet_address --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_system_subnet_name --route-table $aks_name-route -o none
+
+# appgw route table
+echo -e "\e[1;36mCreating Route table and attach to AKS system....\e[0m"
+az network route-table create -g $rg -n $appgw_name-route --disable-bgp-route-propagation true -o none
+az network route-table route create -g $rg -n ToAks --route-table-name $appgw_name-route --address-prefix $aks_system_subnet_address --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
+az network vnet subnet update -g $rg --vnet-name $hub_vnet_name -n $hub_appgw_subnet_name --route-table $appgw_name-route -o none
+
+
+echo "Try to access the following sites: http://aspnetapp.$appgw_pubip.nip.io/"

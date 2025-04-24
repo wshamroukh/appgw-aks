@@ -1,0 +1,477 @@
+# A hub and spoke topology
+# In hub we have an Azure Firewall monitoring Egress Traffic of AKS
+# Spoke VNet has two AKS clusters using AGIC behind a shared AppGW
+
+rg="2aks-2agic-sharedAppgw-azfirewall-hub-spoke"
+location="uaenorth" 
+hub_vnet_name="hub" 
+hub_vnet_address="172.16.0.0/16"
+azfw_name="azfirewall" 
+azfw_subnet_address="172.16.0.0/24"
+aks_vnet_name="aks" 
+aks_vnet_address="10.0.0.0/8"
+appgw_subnet_name="AppGwSubnet" 
+appgw_subnet_address="10.2.1.0/24"
+aks1_subnet_name="aks1-subnet" 
+aks1_subnet_address="10.241.0.0/16"
+aks2_subnet_name="aks2-subnet" 
+aks2_subnet_address="10.242.0.0/16"
+aks1_name="aks1" 
+aks2_name="aks2"
+
+# Creating Resource Group
+echo -e "\e[1;36mCreating Resource Group $rg....\e[0m"
+az group create -n $rg -l $location -o none
+
+# AKS1 Managed Identity
+echo -e "\e[1;36mCreating Managed Identity $aks1_name-identity....\e[0m"
+az identity create -g $rg -n $aks1_name-identity -o none
+aks1_identity_id=$(az identity show -g $rg -n $aks1_name-identity --query id -o tsv)
+
+# AKS2 Managed Identity
+echo -e "\e[1;36mCreating Managed Identity $aks2_name-identity....\e[0m"
+az identity create -g $rg -n $aks2_name-identity -o none
+aks2_identity_id=$(az identity show -g $rg -n $aks2_name-identity --query id -o tsv)
+
+# Creating hub vnet
+echo -e "\e[1;36mCreating Virtual Network $hub_vnet_name....\e[0m"
+az network vnet create -g $rg -n $hub_vnet_name --address-prefixes $hub_vnet_address -o none
+az network vnet subnet create -g $rg --vnet-name $hub_vnet_name -n AzureFirewallSubnet --address-prefix $azfw_subnet_address -o none
+
+# Creating spoke vnet
+echo -e "\e[1;36mCreating Virtual Network $aks_vnet_name....\e[0m"
+az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address -o none
+az network vnet subnet create -g $rg --vnet-name $aks_vnet_name -n $appgw_subnet_name --address-prefix $appgw_subnet_address -o none
+az network vnet subnet create -g $rg --vnet-name $aks_vnet_name -n $aks1_subnet_name --address-prefix $aks1_subnet_address --service-endpoints Microsoft.Sql Microsoft.AzureCosmosDB Microsoft.KeyVault Microsoft.Storage -o none
+az network vnet subnet create -g $rg --vnet-name $aks_vnet_name -n $aks2_subnet_name --address-prefix $aks2_subnet_address --service-endpoints Microsoft.Sql Microsoft.AzureCosmosDB Microsoft.KeyVault Microsoft.Storage -o none
+
+# vnet peering
+echo -e "\e[1;36mCreating Virtual Network Peering between $hub_vnet_name and $aks_vnet_name....\e[0m"
+az network vnet peering create -g $rg -n to-$aks_vnet_name --vnet-name $hub_vnet_name --remote-vnet $aks_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+az network vnet peering create -g $rg -n to-$hub_vnet_name --vnet-name $aks_vnet_name --remote-vnet $hub_vnet_name --allow-vnet-access --allow-forwarded-traffic -o none
+
+# app gw
+appgw_name="appgw"
+echo -e "\e[1;36mCreating Application Gateway $appgw_name....\e[0m"
+az network public-ip create -g $rg -n $appgw_name-pubip --allocation-method Static --sku Standard -o none
+az network application-gateway create -n $appgw_name -g $rg --priority 10 --public-ip-address $appgw_name-pubip --sku Standard_v2 --vnet-name $aks_vnet_name --subnet $appgw_subnet_name --no-wait
+
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $azfw_name-logAnalytics....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $azfw_name-logAnalytics -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $azfw_name-logAnalytics --query id -o tsv)
+
+# create aks1 cluster
+echo -e "\e[1;36mCreating AKS Cluster $aks1_name....\e[0m"
+aks1_subnet_id=$(az network vnet subnet show -g $rg -n $aks1_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+az aks create -g $rg -n $aks1_name --node-count 1 --node-resource-group $rg-$aks1_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --network-plugin azure --assign-identity $aks1_identity_id --node-vm-size Standard_b2ms --vnet-subnet-id $aks1_subnet_id --service-cidr "10.0.0.0/16" --dns-service-ip "10.0.0.10" --docker-bridge-address "172.17.0.1/16" -o none
+
+# create aks2 cluster
+echo -e "\e[1;36mCreating AKS Cluster $aks1_name....\e[0m"
+aks2_subnet_id=$(az network vnet subnet show -g $rg -n $aks2_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+az aks create -g $rg -n $aks2_name --node-count 1 --node-resource-group $rg-$aks2_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --network-plugin azure --assign-identity $aks2_identity_id --node-vm-size Standard_b2ms --vnet-subnet-id $aks2_subnet_id --service-cidr "10.0.0.0/16" --dns-service-ip "10.0.0.10" --docker-bridge-address "172.17.0.1/16" -o none
+
+# Aks1 Pod Identity
+echo -e "\e[1;36mCreating Pod Identity for $aks1_name....\e[0m"
+mgmt_idntity_name=$aks1_name-agic-pod-identity
+az aks get-credentials -g $rg -n $aks1_name
+# Create a managed identity 
+az identity create -g $rg -n $mgmt_idntity_name -o none
+# Obtain clientID for the new managed identity
+identityClientId=$(az identity show -g $rg -n $mgmt_idntity_name --query clientId -o tsv)
+# Obtain ResourceID for the new managed identity
+identityResourceId=$(az identity show -g $rg -n $mgmt_idntity_name --query id -o tsv)
+# Obtain the Subscription ID
+subscriptionId=$(az account show --query 'id' -o tsv)
+# Get the App Gateway ID 
+AppgwID=$(az network application-gateway show -g $rg -n  $appgw_name --query id -o tsv)
+# Obtain the AKS Node Pool Name
+AKSNodePoolName=$(az aks nodepool list --cluster-name $aks1_name -g $rg --query '[].name' -o tsv)
+# Obtain the AKS Node Pool ID
+AKSNodePoolID=$(az aks nodepool show --cluster-name $aks1_name --name $AKSNodePoolName -g $rg --query 'id' -o tsv)
+# Obtain the AKS Kubelet Identity ObjectId
+kubeletidentityobjectId=$(az aks show -g $rg -n $aks1_name --query 'identityProfile.kubeletidentity.objectId' -o tsv)
+# Obtain ResourceID for the Kubelet Identity
+kubeletidentityResourceID=$(az aks show -g $rg -n $aks1_name --query 'identityProfile.kubeletidentity.resourceId' -o tsv)
+# Obtain ClientID for the Kubelet Identity
+kubeletidentityClientID=$(az aks show -g $rg -n $aks1_name --query 'identityProfile.kubeletidentity.clientId' -o tsv)
+# Obtain the AKS Node Resource Group
+AKSNodeRG=$(az aks list -g $rg --query '[0].nodeResourceGroup' -o tsv)
+sleep 45
+echo -e "\e[1;36mAssign Contributor role to $mgmt_idntity_name on $appgw_name AppGW and $aks1_name resources....\e[0m"
+# Give the identity Contributor access to the Application Gateway
+az role assignment create --role Contributor --assignee $identityClientId --scope $AppgwID -o none
+# Get the Application Gateway resource group ID
+ResourceGroupID=$(az group show -n $rg --query id -o tsv)
+# Give the identity Reader access to the Application Gateway resource group
+az role assignment create --role Contributor --assignee $identityClientId --scope $ResourceGroupID -o none
+# Give the identity Contributor access to the Resource Group
+az role assignment create --assignee $identityClientId --role "Contributor" --scope $ResourceGroupID -o none
+# Give the identity Contributor access to the AKSNodePool
+az role assignment create --assignee $identityClientId --role "Contributor" --scope $AKSNodePoolID -o none
+# Assign the Kubelet Identity objectId contributor access to the AKS Node RG
+az role assignment create --assignee $kubeletidentityobjectId --role "Contributor" --scope /subscriptions/$subscriptionId/resourceGroups/$AKSNodeRG -o none
+# Assign the Kubelet Identity the Managed Identity Operator role on the new managed identity
+az role assignment create --assignee $kubeletidentityobjectId --role "Managed Identity Operator" --scope $identityResourceId -o none
+# Deploy an AAD pod identity in an RBAC-enabled cluster (comment line 62 if not using an RBAC-enabled cluster.)
+echo -e "\e[1;36mDeploying an AAD pod identity in $aks1_name resources....\e[0m"
+kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
+
+# Helm AGIC Configuration file
+echo -e "\e[1;36mDownloading AGIC config file....\e[0m"
+wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-agic-config.yaml
+# Modifying the helm chart config file for AGIC#1
+echo -e "\e[1;36mDeploying the AGIC Controller $appgw_name-agic ....\e[0m"
+sed -i "/<subscriptionId>/ s//$subscriptionId/" helm-agic-config.yaml
+sed -i "/<resourceGroupName>/ s//$rg/" helm-agic-config.yaml
+sed -i "/<applicationGatewayName>/ s//$appgw_name/" helm-agic-config.yaml
+sed -i "s|shared: false|shared: true|" helm-agic-config.yaml
+sed -i "s|<identityResourceId>|${identityResourceId}|g" helm-agic-config.yaml
+sed -i "/<identityClientId>/ s//$identityClientId/" helm-agic-config.yaml
+sed -i -e "s|enabled: false # true/false|enabled: true # true/false|" helm-agic-config.yaml
+# Installing Helm
+echo -e "\e[1;36mInstalling Helm tool....\e[0m"
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod +x get_helm.sh
+./get_helm.sh
+# clean up get_helm.sh
+rm ./get_helm.sh
+# Adding AGIC helm repo
+echo -e "\e[1;36mAdding AGIC Helm Repo....\e[0m"
+helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
+helm repo update
+# Ensure the AzureIngressProhibitedTarget CRD is installed with:
+echo -e "\e[1;36mEnsure the AzureIngressProhibitedTarget CRD is installed....\e[0m"
+kubectl apply -f https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/crds/AzureIngressProhibitedTarget-v1-CRD-v1.yaml
+# Deploying AGIC
+echo -e "\e[1;36mDeploying $appgw_name-agic AppGW Ingress Controller to $aks1_name....\e[0m"
+helm upgrade --install $appgw_name-agic -f helm-agic-config.yaml application-gateway-kubernetes-ingress/ingress-azure
+# Confirm crd installation
+kubectl get AzureIngressProhibitedTargets --all-namespaces
+# delete first agic helm config file
+rm helm-agic-config.yaml
+
+# Aks2 Pod Identity
+echo -e "\e[1;36mCreating Pod Identity for $aks2_name....\e[0m"
+mgmt_idntity_name=$aks2_name-agic-pod-identity
+az aks get-credentials -g $rg -n $aks2_name
+# Create a managed identity 
+az identity create -g $rg -n $mgmt_idntity_name -o none
+# Obtain clientID for the new managed identity
+identityClientId=$(az identity show -g $rg -n $mgmt_idntity_name --query clientId -o tsv)
+# Obtain ResourceID for the new managed identity
+identityResourceId=$(az identity show -g $rg -n $mgmt_idntity_name --query id -o tsv)
+# Obtain the Subscription ID
+subscriptionId=$(az account show --query 'id' -o tsv)
+# Get the App Gateway ID 
+AppgwID=$(az network application-gateway show -g $rg -n  $appgw_name --query id -o tsv)
+# Obtain the AKS Node Pool Name
+AKSNodePoolName=$(az aks nodepool list --cluster-name $aks2_name -g $rg --query '[].name' -o tsv)
+# Obtain the AKS Node Pool ID
+AKSNodePoolID=$(az aks nodepool show --cluster-name $aks2_name --name $AKSNodePoolName -g $rg --query 'id' -o tsv)
+# Obtain the AKS Kubelet Identity ObjectId
+kubeletidentityobjectId=$(az aks show -g $rg -n $aks2_name --query 'identityProfile.kubeletidentity.objectId' -o tsv)
+# Obtain ResourceID for the Kubelet Identity
+kubeletidentityResourceID=$(az aks show -g $rg -n $aks2_name --query 'identityProfile.kubeletidentity.resourceId' -o tsv)
+# Obtain ClientID for the Kubelet Identity
+kubeletidentityClientID=$(az aks show -g $rg -n $aks2_name --query 'identityProfile.kubeletidentity.clientId' -o tsv)
+# Obtain the AKS Node Resource Group
+AKSNodeRG=$(az aks list -g $rg --query '[1].nodeResourceGroup' -o tsv)
+# wait for the identity to be replicated
+sleep 45
+echo -e "\e[1;36mAssign Contributor role to $mgmt_idntity_name on $appgw_name AppGW and $aks2_name resources....\e[0m"
+# Give the identity Contributor access to the Application Gateway
+az role assignment create --role Contributor --assignee $identityClientId --scope $AppgwID -o none
+# Get the Application Gateway resource group ID
+ResourceGroupID=$(az group show -n $rg --query id -o tsv)
+# Give the identity Reader access to the Application Gateway resource group
+az role assignment create --role Contributor --assignee $identityClientId --scope $ResourceGroupID -o none
+# Give the identity Contributor access to the Resource Group
+az role assignment create --assignee $identityClientId --role "Contributor" --scope $ResourceGroupID -o none
+# Give the identity Contributor access to the AKSNodePool
+az role assignment create --assignee $identityClientId --role "Contributor" --scope $AKSNodePoolID -o none
+# Assign the Kubelet Identity objectId contributor access to the AKS Node RG
+az role assignment create --assignee $kubeletidentityobjectId  --role "Contributor" --scope /subscriptions/$subscriptionId/resourceGroups/$AKSNodeRG -o none
+# Assign the Kubelet Identity the Managed Identity Operator role on the new managed identity
+az role assignment create --assignee $kubeletidentityobjectId  --role "Managed Identity Operator" --scope $identityResourceId -o none
+# Deploy an AAD pod identity in an RBAC-enabled cluster (comment line 62 if not using an RBAC-enabled cluster.)
+echo -e "\e[1;36mDeploying an AAD pod identity in $aks2_name resources....\e[0m"
+kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
+
+# Helm AGIC Configuration file
+echo -e "\e[1;36mDownloading AGIC config file....\e[0m"
+wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-agic-config.yaml
+# Modifying the helm chart config file for AGIC#1
+echo -e "\e[1;36mDeploying the AGIC Controller $appgw_name-agic ....\e[0m"
+sed -i "/<subscriptionId>/ s//$subscriptionId/" helm-agic-config.yaml
+sed -i "/<resourceGroupName>/ s//$rg/" helm-agic-config.yaml
+sed -i "/<applicationGatewayName>/ s//$appgw_name/" helm-agic-config.yaml
+sed -i "s|shared: false|shared: true|" helm-agic-config.yaml
+sed -i "s|<identityResourceId>|${identityResourceId}|g" helm-agic-config.yaml
+sed -i "/<identityClientId>/ s//$identityClientId/" helm-agic-config.yaml
+sed -i -e "s|enabled: false # true/false|enabled: true # true/false|" helm-agic-config.yaml
+# Ensure the AzureIngressProhibitedTarget CRD is installed with:
+echo -e "\e[1;36mEnsure the AzureIngressProhibitedTarget CRD is installed....\e[0m"
+kubectl apply -f https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/crds/AzureIngressProhibitedTarget-v1-CRD-v1.yaml
+# Deploying AGIC
+echo -e "\e[1;36mDeploying $appgw_name-agic AppGW Ingress Controller to $aks2_name....\e[0m"
+helm upgrade --install $appgw_name-agic -f helm-agic-config.yaml application-gateway-kubernetes-ingress/ingress-azure
+# Confirm crd installation
+kubectl get AzureIngressProhibitedTargets --all-namespaces
+
+# Getting AppGW Public IP
+appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv) && echo "$appgw_name: $appgw_pubip"
+
+# Preventing AGIC of AKS1 from removing the changes of AKS2 AGIC
+echo -e "\e[1;36mPreventing AGIC of $aks1_name from removing the changes of $aks2_name AGIC....\e[0m"
+az aks get-credentials -g $rg -n $aks1_name
+cat <<EOF | kubectl apply -f -
+apiVersion: "appgw.ingress.k8s.io/v1"
+kind: AzureIngressProhibitedTarget
+metadata:
+  name: aks2prohibit
+spec:
+  hostname: aks2.$appgw_pubip.nip.io
+EOF
+# Confirm crd installation
+kubectl get AzureIngressProhibitedTargets
+# deletel broad:
+kubectl delete AzureIngressProhibitedTarget prohibit-all-targets
+kubectl get AzureIngressProhibitedTargets
+
+# Preventing AGIC of AKS2 from removing the changes of AKS1 AGIC
+echo -e "\e[1;36mPreventing AGIC of $aks2_name from removing the changes of $aks1_name AGIC....\e[0m"
+az aks get-credentials -g $rg -n $aks2_name
+cat <<EOF | kubectl apply -f -
+apiVersion: "appgw.ingress.k8s.io/v1"
+kind: AzureIngressProhibitedTarget
+metadata:
+  name: aks1prohibit
+spec:
+  hostname: aks1.$appgw_pubip.nip.io
+EOF
+# Confirm 
+kubectl get AzureIngressProhibitedTargets
+# delete broad
+kubectl delete AzureIngressProhibitedTarget prohibit-all-targets
+kubectl get AzureIngressProhibitedTarget
+# delete first agic helm config file
+rm helm-agic-config.yaml
+
+#############################
+# App1 deployed to aks1     #
+#############################
+echo -e "\e[1;36mDeploying a service on $aks1_name with ingress....\e[0m"
+az aks get-credentials -g $rg -n $aks1_name
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aks1
+  labels:
+    app: aks1
+spec:
+  containers:
+  - image: "mcr.microsoft.com/dotnet/samples:aspnetapp"
+    name: aspnetapp-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aks1-svc
+spec:
+  selector:
+    app: aks1
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aks1-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "aks1.$appgw_pubip.nip.io"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: aks1-svc
+            port: 
+              number: 80
+EOF
+
+# deply App2 on AKS1 for testing firewall
+cat <<eof | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: centos
+spec:
+  containers:
+  - name: centoss
+    image: centos
+    ports:
+    - containerPort: 80
+    command:
+    - sleep
+    - "3600"
+eof
+
+
+
+sleep 15 
+# verify
+kubectl get deployment,pod,svc,ingress
+
+#############################
+# App1  deployed to aks2    #
+#############################
+echo -e "\e[1;36mDeploying a service on $aks2_name with ingress....\e[0m"
+az aks get-credentials -g $rg -n $aks2_name
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aks2
+  labels:
+    app: aks2
+spec:
+  containers:
+  - image: "mcr.microsoft.com/dotnet/samples:aspnetapp"
+    name: aspnetapp-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aks2-svc
+spec:
+  selector:
+    app: aks2
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aks2-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "aks2.$appgw_pubip.nip.io"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: aks2-svc
+            port: 
+              number: 80
+EOF
+
+# deply App2 on AKS2 for testing firewall
+cat <<eof | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: centos
+spec:
+  containers:
+  - name: centoss
+    image: centos
+    ports:
+    - containerPort: 80
+    command:
+    - sleep
+    - "3600"
+eof
+
+echo -e "\e[1;36mRun the following command to check if the aks subnet is being protected by the Az Firewall: kubectl exec -ti centos -- /bin/bash \nThen run the following command: curl www.cnn.com...\e[0m"
+
+sleep 15
+# verify
+kubectl get deployment,pod,svc,ingress
+
+echo "confirm you are able to access both apps: http://aks1.$appgw_pubip.nip.io and http://aks1.$appgw_pubip.nip.io"
+
+# azure firewall and policy https://docs.microsoft.com/en-us/azure/aks/limit-egress-traffic#required-ports-and-addresses-for-aks-clusters
+echo -e "\e[1;36mCreating Azure Firewall Policy....\e[0m"
+azfw_policy_name=azfirewall-policy
+az extension add -n azure-firewall
+az extension update -n azure-firewall
+az network firewall policy create -n $azfw_policy_name -g $rg -o none
+# Azure Firewall Rule Collection Group
+az network firewall policy rule-collection-group create -n AksEgressPolicyRuleCollectionGroup --policy-name $azfw_policy_name -g $rg --priority 500 -o none
+# Azure Firewall Application Rules
+az network firewall policy rule-collection-group collection add-filter-collection -g $rg -n AllowApplicationRules --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --action Allow --rule-name AllowAzureGlobalFQDNs --collection-priority 500 --rule-type ApplicationRule  --protocols https=443 --source-addresses "*" --target-fqdns "*.hcp.$location.azmk8s.io" "mcr.microsoft.com" "*.data.mcr.microsoft.com" "management.azure.com" "login.microsoftonline.com" "packages.microsoft.com" "acs-mirror.azureedge.net" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowOptRecomFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 --source-addresses "*" --target-fqdns "security.ubuntu.com" "azure.archive.ubuntu.com" "nchangelogs.ubuntu.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowGPUFQDNs --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "nvidia.github.io" "us.download.nvidia.com" "download.docker.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowReqWinCluster --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols http=80 https=443 --source-addresses "*" --target-fqdns "onegetcdn.azureedge.net" "go.microsoft.com" "*.mp.microsoft.com" "www.msftconnecttest.com" "ctldl.windowsupdate.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowDefender --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "login.microsoftonline.com" "*.ods.opinsights.azure.com" "*.oms.opinsights.azure.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowCSISecretStore --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "vault.azure.net	" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowAzurePolicy --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses "*" --target-fqdns "data.policy.core.windows.net" "store.policy.core.windows.net" "dc.services.visualstudio.com" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg -n AllowClusterExtensions --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowApplicationRules --rule-type ApplicationRule --protocols https=443 --source-addresses '*' --target-fqdns "$location.dp.kubernetesconfiguration.azure.com" "mcr.microsoft.com" "*.data.mcr.microsoft.com" -o none
+# Azure Firewall Network Rules
+az network firewall policy rule-collection-group collection add-filter-collection -n AllowNetworkRules -g $rg --policy-name $azfw_policy_name --rcg-name AksEgressPolicyRuleCollectionGroup --action Allow  --rule-name AllowAzureGlobalUDP --collection-priority 400 --rule-type NetworkRule --source-addresses "*" --ip-protocols udp --destination-addresses "*" --destination-ports "1194" "123" "53" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAzureGlobalTCP --rule-type NetworkRule --dest-addr "*" --destination-ports "9000" "443" --ip-protocols TCP --source-addresses "*" -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAKStoAppGW --rule-type NetworkRule --dest-addr $appgw_subnet_address --destination-ports '*' --ip-protocols Any --source-addresses $aks1_subnet_address $aks2_subnet_address -o none
+az network firewall policy rule-collection-group collection rule add -g $rg --policy-name $azfw_policy_name --rule-collection-group-name AksEgressPolicyRuleCollectionGroup --collection-name AllowNetworkRules -n AllowAppGWtoAKS --rule-type NetworkRule --dest-addr $aks1_subnet_address $aks2_subnet_address --destination-ports '*' --ip-protocols Any --source-addresses $appgw_subnet_address -o none
+
+# azure firewall
+echo -e "\e[1;36mCreating Azure Firewall....\e[0m"
+az network public-ip create -g $rg -n $azfw_name-pubip --sku standard --allocation-method static -o none
+fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress)
+az network firewall create -n $azfw_name -g $rg --sku AZFW_VNet --firewall-policy $azfw_policy_name -l $location -o none
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
+az monitor diagnostic-settings create -n $azfw_name-logs --resource $azfw_id --workspace $log_analytics_ws_id --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' --logs '[{"categoryGroup": "allLogs", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'  -o none
+az network firewall ip-config create --firewall-name $azfw_name -n $azfw_name --public-ip-address $azfw_name-pubip -g $rg --vnet-name $hub_vnet_name -o none
+fw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query ipConfigurations[].privateIpAddress -o tsv) && echo $fw_private_ip
+fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress -o tsv) && echo $fw_public_ip
+
+
+#Deploy Azure Monitor Workbook for Azure Firewall
+echo -e "\e[1;36mDeploying Azure Monitor Workbook for Azure Firewall....\e[0m"
+guid=$(curl -s https://www.uuidgenerator.net/api/version1)
+templateUri="https://raw.githubusercontent.com/Azure/Azure-Network-Security/master/Azure%20Firewall/Workbook%20-%20Azure%20Firewall%20Monitor%20Workbook/Azure%20Firewall_ARM.json"
+az group deployment create -g $rg -n deployAzMonitorForFW --template-uri $templateUri -p "workbookDisplayName=$azfw_name-workbook" 'workbookType=workbook' "workbookSourceId=$log_analytics_ws_id" "workbookId=$guid" -o none
+
+# route table from aks1_subnet to az firewall
+echo -e "\e[1;36mCreating a Route Table (UDR) and attaching it to $aks1_subnet_name subnet ....\e[0m"
+az network route-table create -g $rg -n $aks1_name-rt -o none
+az network route-table route create -g $rg -n to-anything --route-table-name $aks1_name-rt --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $fw_private_ip -o none
+az network route-table route create -g $rg --name $azfw_name-internet --route-table-name $aks1_name-rt --address-prefix $fw_public_ip/32 --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks1_subnet_name --route-table $aks1_name-rt -o none
+
+# route table from aks2_subnet to az firewall
+echo -e "\e[1;36mCreating a Route Table (UDR) and attaching it to $aks2_subnet_name subnet ....\e[0m"
+az network route-table create -g $rg -n $aks2_name-rt -o none
+az network route-table route create -g $rg -n to-anything --route-table-name $aks2_name-rt --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $fw_private_ip -o none
+az network route-table route create -g $rg --name $azfw_name-internet --route-table-name $aks2_name-rt --address-prefix $fw_public_ip/32 --next-hop-type Internet -o none
+az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks2_subnet_name --route-table $aks2_name-rt -o none
+
+echo "confirm you are still able to access both apps: http://aks1.$appgw_pubip.nip.io and http://aks1.$appgw_pubip.nip.io"
+echo -e "\e[1;36mConnect to each aks cluster and run the following command to check if the aks subnet is being protected by the Az Firewall: kubectl exec -ti centos -- /bin/bash \nThen run the following command: curl www.cnn.com...\e[0m"

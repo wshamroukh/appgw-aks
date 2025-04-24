@@ -1,0 +1,281 @@
+# A private AKS with Application Gateway Ingress Controller (AKS Add-On Greenfield Deployment) - AGIC add-on, AKS, and Application Gateway on blank-slate infrastructure.
+
+# Variables
+rg='aks-agic-addon'
+location='uaenorth'
+aks_vnet_name='aks'
+aks_vnet_address='10.0.0.0/8'
+aks_system_subnet_name='AksSubnet'
+aks_system_subnet_address='10.0.0.0/16'
+aks_vm_subnet_name='VMSubnet'
+aks_vm_subnet_address='10.2.0.0/24'
+aks_appgw_subnet_name='AppGwSubnet'
+aks_appgw_subnet_address='10.2.1.0/24'
+aks_name='akscluster'
+aks_jump_vm_name='jump'
+
+jump_init_file=~/jump_init.txt
+cat <<EOF > $jump_init_file
+#cloud-config
+runcmd:
+  - echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+  - apt-get update -y && apt-get dist-upgrade -y && apt autoremove -y
+  - sudo curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl &&
+  - chmod +x ./kubectl &&
+  - mv ./kubectl /usr/local/bin/kubectl
+  - sudo curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 &&
+  - chmod 700 get_helm.sh &&
+  - ./get_helm.sh
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+EOF
+
+# resource group
+echo -e "\e[1;36mCreating Resource Group $rg....\e[0m"
+az group create --location $location -n $rg -o none
+
+# vnets
+echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
+az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address --subnet-name $aks_system_subnet_name --subnet-prefixes $aks_system_subnet_address -o none
+az network vnet subnet create -g $rg -n $aks_vm_subnet_name --address-prefixes $aks_vm_subnet_address --vnet-name $aks_vnet_name -o none
+az network vnet subnet create -g $rg -n $aks_appgw_subnet_name --address-prefixes $aks_appgw_subnet_address --vnet-name $aks_vnet_name -o none
+
+# app gw
+appgw_name="aks-appgw"
+echo -e "\e[1;36mCreating Application Gateway $appgw_name....\e[0m"
+az network public-ip create -g $rg -n $appgw_name-pubip --allocation-method Static --sku Standard -o none
+az network application-gateway create -n $appgw_name -g $rg --public-ip-address $appgw_name-pubip --sku Standard_v2 --vnet-name $aks_vnet_name --subnet $aks_appgw_subnet_name --no-wait
+
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-logAnalytics....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $aks_name-logAnalytics -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv)
+
+# nsg
+echo -e "\e[1;36mCreating Jump box NSG $aks_jump_vm_name-nsg....\e[0m"
+myip=$(curl -s https://ifconfig.co)
+az network nsg create -g $rg -n $aks_jump_vm_name-nsg -o none
+az network nsg rule create -g $rg -n AllowSSH --nsg-name $aks_jump_vm_name-nsg --priority 200 --access Allow --description "Allow ssh from $myip" --destination-address-prefixes $aks_vm_subnet_address --destination-port-ranges 22 --direction Inbound --protocol Tcp --source-address-prefixes $myip --source-port-ranges "*" -o none
+
+# jump vm
+admin_username=$(whoami)
+echo -e "\e[1;36mCreating Jump box $aks_jump_vm_name....\e[0m"
+az network public-ip create -g $rg -n $aks_jump_vm_name-pubip --allocation-method Static --sku Basic -o none
+az network nic create -g $rg -n $aks_jump_vm_name-nic --vnet-name $aks_vnet_name --subnet $aks_vm_subnet_name --public-ip-address $aks_jump_vm_name-pubip --network-security-group $aks_jump_vm_name-nsg -o none
+az vm create -g $rg -n $aks_jump_vm_name --nics $aks_jump_vm_name-nic --os-disk-name $aks_jump_vm_name-osdisk --image UbuntuLTS --admin-username $admin_username --custom-data $jump_init_file  --generate-ssh-keys --no-wait -o none
+jump_vm_pubip=$(az network public-ip show -g $rg -n $aks_jump_vm_name-pubip --query ipAddress -o tsv)
+
+# aks cluster
+echo -e "\e[1;36mCreating AKS Managed Identity $aks_name-identity....\e[0m"
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+az identity create -g $rg -n $aks_name-identity -o none
+aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv)
+echo -e "\e[1;36mCreating AKS Cluster $aks_name....\e[0m"
+az aks create -g $rg -n $aks_name --node-resource-group $rg-$aks_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --enable-managed-identity --enable-rbac --assign-identity $aks_identity_id --enable-private-cluster --node-vm-size Standard_b2ms --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --network-plugin azure --vnet-subnet-id $aks_system_subnet_id --docker-bridge-address "172.17.0.1/16" --service-cidr "10.3.0.0/16" --dns-service-ip "10.3.0.10" -o none
+
+# Enable ingress-appgw
+echo -e "\e[1;36m\nEnabling ingress-appgw add-on on $aks_name....\e[0m"
+appgwId=$(az network application-gateway show -n $appgw_name -g $rg -o tsv --query "id") && echo $appgwId
+az aks enable-addons -n $aks_name -g $rg -a "ingress-appgw" --appgw-id $appgwId -o none
+
+# Get appgw public IP address
+appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv) && echo $appgw_pubip
+
+
+# Deploy apps
+##########
+# APP #1 #
+##########
+aspnetapp_file=~/aspnetapp.yaml
+cat <<EOF > $aspnetapp_file
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aspnetapp
+  labels:
+    app: aspnetapp
+spec:
+  containers:
+  - image: "mcr.microsoft.com/dotnet/core/samples:aspnetapp"
+    name: aspnetapp-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aspnetapp-svc
+spec:
+  selector:
+    app: aspnetapp
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aspnetapp-ing
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "aspnetapp.waddah.net"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: aspnetapp-svc
+            port: 
+              number: 80
+EOF
+
+##########
+# APP #2 #
+##########
+nginx_file=~/nginx.yaml
+cat <<EOF > $nginx_file
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-svc
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-ing
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "nginx.waddah.net"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-svc
+            port: 
+              number: 80
+EOF
+
+##########
+# APP #3 #
+##########
+httpd_file=~/httpd.yaml
+cat <<EOF > $httpd_file
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpd-deployment
+  labels:
+    app: httpd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: httpd
+  template:
+    metadata:
+      labels:
+        app: httpd
+    spec:
+      containers:
+      - name: httpd
+        image: httpd
+        ports:
+        - containerPort: 80
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpd-svc
+spec:
+  selector:
+    app: httpd
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: httpd-ing
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "httpd.waddah.net"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: httpd-svc
+            port: 
+              number: 80
+EOF
+##ssh into the jump vm and run the following commands:
+echo -e "\e[1;36mSSH'ing into jump box ($jump_vm_pubip) and then deploying an application into the AKS Cluster....\e[0m"
+username=$(whoami)
+scp -o StrictHostKeyChecking=no $aspnetapp_file $nginx_file $httpd_file $jump_vm_pubip:/home/$username
+echo -e "\e[1;36mLogin to your Azure Subscription where this environment was created....\e[0m"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "az login -o none"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "az aks get-credentials -g $rg -n $aks_name"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl apply -f $aspnetapp_file; kubectl apply -f $nginx_file; kubectl apply -f $httpd_file"
+# delete yaml files
+rm $aspnetapp_file $nginx_file $httpd_file $jump_init_file
+# add dns records
+az network dns record-set a add-record -g PermanentResources --zone-name waddah.net --ipv4-address $appgw_pubip --record-set-name aspnetapp -o none
+az network dns record-set a add-record -g PermanentResources --zone-name waddah.net --ipv4-address $appgw_pubip --record-set-name nginx -o none
+az network dns record-set a add-record -g PermanentResources --zone-name waddah.net --ipv4-address $appgw_pubip --record-set-name httpd -o none
+sleep 40
+# List deployment, pods, svc, ingress
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl get all"
+ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no $jump_vm_pubip "kubectl get deployment,pod,svc,ingress --all-namespaces -o wide"
+
