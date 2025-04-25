@@ -1,7 +1,7 @@
 # Application Gateway before Azure Firewall. AKS has AGIC addon installed and behind AppGW
 # Variables
-rg='aks-appgw-agic-fw'
-location='uaenorth'
+rg='aks-appgw-agic-fw1'
+location='centralindia'
 hub_vnet_name='hub'
 hub_vnet_address='10.1.0.0/16'
 hub_fw_subnet_name='AzureFirewallSubnet'
@@ -16,7 +16,7 @@ aks_system_subnet_address='10.0.0.0/21'
 aks_vm_subnet_name='VMSubnet'
 aks_vm_subnet_address='10.0.8.0/21'
 aks_name='akscluster'
-vm_size=Standard_b2ms
+vm_size=Standard_B4als_v2
 
 admin_username=$(whoami)
 
@@ -27,7 +27,7 @@ az group create --location $location -n $rg -o none
 # AKS Managed Identity
 echo -e "\e[1;36mCreating AKS Managed Identity $aks_name-identity....\e[0m"
 az identity create -g $rg -n $aks_name-identity -o none
-aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv)
+aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv | tr -d '\r')
 
 # Hub VNet
 echo -e "\e[1;36mCreating VNet $hub_vnet_name....\e[0m"
@@ -52,23 +52,24 @@ az network application-gateway create -n $appgw_name -g $rg --priority 10 --publ
 # log analytics
 echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-logAnalytics....\e[0m"
 az monitor log-analytics workspace create -g $rg -n $aks_name-logAnalytics -o none
-log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv)
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv | tr -d '\r')
 
 # aks cluster
-aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
-az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons monitoring --workspace-resource-id $log_analytics_ws_id --enable-managed-identity --assign-identity $aks_identity_id --nodepool-name systempool --node-vm-size Standard_b2ms --generate-ssh-keys --admin-username $admin_username --docker-bridge-address "172.17.0.1/16" --network-plugin azure --vnet-subnet-id $aks_system_subnet_id --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --service-cidr "10.2.0.0/24" --dns-service-ip "10.2.0.10" -o none
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r')
+az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons monitoring --workspace-resource-id $log_analytics_ws_id --enable-managed-identity --assign-identity $aks_identity_id --nodepool-name systempool --node-vm-size Standard_B4als_v2 --generate-ssh-keys --admin-username $admin_username --docker-bridge-address "172.17.0.1/16" --network-plugin azure --vnet-subnet-id $aks_system_subnet_id --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --service-cidr "10.2.0.0/24" --dns-service-ip "10.2.0.10" -o none
 
 # Enable ingress-appgw
 echo -e "\e[1;36m\nEnabling ingress-appgw add-on on $aks_name....\e[0m"
-appgwId=$(az network application-gateway show -n $appgw_name -g $rg -o tsv --query "id")
+appgwId=$(az network application-gateway show -n $appgw_name -g $rg -o tsv --query id -o tsv | tr -d '\r')
 az aks enable-addons -n $aks_name -g $rg -a "ingress-appgw" --appgw-id $appgwId -o none
 
 # # Get appgw public IP address
-appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv) && echo "$appgw_name public IP address: $appgw_pubip"
+appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv | tr -d '\r') && echo "$appgw_name public IP address: $appgw_pubip"
 
 # Deploy apps to AKS Cluster
 echo -e "\e[1;36mDeploying apps on $aks_name with AGIC ingress....\e[0m"
-az aks get-credentials -g $rg -n $aks_name --admin
+az aks get-credentials -g $rg -n $aks_name --overwrite-existing
+cp /mnt/c/Users/waddahsh/.kube/config ~/.kube/config
 
 # Deploy apps
 ##########
@@ -78,13 +79,13 @@ cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
 metadata:
-  name: aspnetapp
+  name: inspectorgadget
   labels:
-    app: aspnetapp
+    app: inspectorgadget
 spec:
   containers:
-  - image: "mcr.microsoft.com/dotnet/core/samples:aspnetapp"
-    name: aspnetapp-image
+  - image: jelledruyts/inspectorgadget:latest
+    name: inspectorgadget-image
     ports:
     - containerPort: 80
       protocol: TCP
@@ -94,10 +95,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: aspnetapp-svc
+  name: inspectorgadget-svc
 spec:
   selector:
-    app: aspnetapp
+    app: inspectorgadget
   ports:
   - protocol: TCP
     port: 80
@@ -108,27 +109,27 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: aspnetapp-ing
+  name: inspectorgadget-ing
   annotations:
     kubernetes.io/ingress.class: azure/application-gateway
 spec:
   rules:
-  - host: "aspnetapp.$appgw_pubip.nip.io"
+  - host: "inspectorgadget.$appgw_pubip.nip.io"
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: aspnetapp-svc
+            name: inspectorgadget-svc
             port: 
               number: 80
 EOF
 
 
-kubectl get deploy,pod,svc,ingress
+kubectl get deployment,pod,svc,ingress --all-namespaces -o wide
 sleep 20
-echo "Try to access the following sites: http://aspnetapp.$appgw_pubip.nip.io/"
+echo "Try to access the following sites: http://inspectorgadget.$appgw_pubip.nip.io/"
 
 # azure firewall and policy
 echo -e "\e[1;36mCreating Azure Firewall Policy....\e[0m"
@@ -156,33 +157,31 @@ az network firewall policy rule-collection-group collection rule add -g $rg --po
 
 echo -e "\e[1;36mCreating Azure Firewall ....\e[0m"
 azfw_name='azfirewall'
-az network public-ip create -n $azfw_name-pubip -g $rg --allocation-method static --sku standard --tags $tag -o none
-az network firewall create -n $azfw_name -g $rg --sku AZFW_VNet --firewall-policy $azfw_policy_name --tier Premium --tags $tag -o none
-azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id)
-az monitor diagnostic-settings create -n $azfw_name-logs --resource $azfw_id --workspace $log_analytics_ws_id --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false }, "timeGrain": null}]' --logs '[{"category": "AzureFirewallApplicationRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}, {"category": "AzureFirewallNetworkRule", "enabled": true, "retentionPolicy": {"days": 0, "enabled": false}}]'  -o none
+az network public-ip create -n $azfw_name-pubip -g $rg --allocation-method static --sku standard -o none
+az network firewall create -n $azfw_name -g $rg --sku AZFW_VNet --firewall-policy $azfw_policy_name --tier Premium -o none
+azfw_id=$(az network firewall show -n $azfw_name -g $rg -o tsv --query id -o tsv | tr -d '\r') && echo $azfw_id
+az monitor diagnostic-settings create -n $azfw_name-logs --resource $azfw_id --workspace $log_analytics_ws_id --export-to-resource-specific true --logs '[{"category":"AZFWApplicationRule","Enabled":true}, {"category":"AZFWNetworkRule","Enabled":true}, {"category":"AZFWApplicationRuleAggregation","Enabled":true}, {"category":"AZFWDnsQuery","Enabled":true}, {"category":"AZFWFlowTrace","Enabled":true} , {"category":"AZFWIdpsSignature","Enabled":true}, {"category":"AZFWNatRule","Enabled":true}, {"category":"AZFWFatFlow","Enabled":true}, {"category":"AZFWNatRuleAggregation","Enabled":true}, {"category":"AZFWNetworkRuleAggregation","Enabled":true}, {"category":"AZFWThreatIntel","Enabled":true}]' -o none
 az network firewall ip-config create --firewall-name $azfw_name -g $rg --vnet-name $hub_vnet_name --public-ip-address $azfw_name-pubip -n azfwconfig -o none
 az network firewall update -n $azfw_name -g $rg -o none
-hub_fw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query ipConfigurations[].privateIpAddress -o tsv)
-hub_fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress -o tsv)
-
-#Deploy Azure Monitor Workbook for Azure Firewall
-echo -e "\e[1;36mDeploying Azure Monitor Workbook for Azure Firewall....\e[0m"
-guid=$(curl -s https://www.uuidgenerator.net/api/version1)
-templateUri="https://raw.githubusercontent.com/Azure/Azure-Network-Security/master/Azure%20Firewall/Workbook%20-%20Azure%20Firewall%20Monitor%20Workbook/Azure%20Firewall_ARM.json"
-az group deployment create -g $rg -n deployAzMonitorForFW --template-uri $templateUri -p "workbookDisplayName=$azfw_name-workbook" 'workbookType=workbook' "workbookSourceId=$log_analytics_ws_id" "workbookId=$guid" -o none
+hub_fw_private_ip=$(az network firewall show -g $rg -n $azfw_name --query ipConfigurations[].privateIPAddress -o tsv | tr -d '\r') && echo "$azfw_name private IP address: $hub_fw_private_ip"
+hub_fw_public_ip=$(az network public-ip show -g $rg -n $azfw_name-pubip --query ipAddress -o tsv | tr -d '\r') && echo "$azfw_name public IP address: $hub_fw_public_ip"
 
 # aks route table
-echo -e "\e[1;36mCreating Route table and attach to AKS system....\e[0m"
+echo -e "\e[1;36mCreating Route table and attach to AKS subnet....\e[0m"
 az network route-table create -g $rg -n $aks_name-route --disable-bgp-route-propagation true -o none
 az network route-table route create -g $rg -n ToAnything --route-table-name $aks_name-route --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
 az network route-table route create -g $rg -n ToAppGW --route-table-name $aks_name-route --address-prefix $hub_appgw_subnet_address --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
 az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks_system_subnet_name --route-table $aks_name-route -o none
 
 # appgw route table
-echo -e "\e[1;36mCreating Route table and attach to AKS system....\e[0m"
+echo -e "\e[1;36mCreating Route table and attach to APPGW Subnet....\e[0m"
 az network route-table create -g $rg -n $appgw_name-route --disable-bgp-route-propagation true -o none
 az network route-table route create -g $rg -n ToAks --route-table-name $appgw_name-route --address-prefix $aks_system_subnet_address --next-hop-type VirtualAppliance --next-hop-ip-address $hub_fw_private_ip -o none
 az network vnet subnet update -g $rg --vnet-name $hub_vnet_name -n $hub_appgw_subnet_name --route-table $appgw_name-route -o none
 
 
-echo "Try to access the following sites: http://aspnetapp.$appgw_pubip.nip.io/"
+echo "Try to access the following site after routing the traffic through azure firewall: http://inspectorgadget.$appgw_pubip.nip.io/"
+
+# Cleanup
+# az group delete -g $rg --yes --no-wait -o none
+

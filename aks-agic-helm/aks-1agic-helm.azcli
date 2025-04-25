@@ -2,7 +2,7 @@
 
 # Variables
 rg='aks-1agic-helm'
-location='uaenorth'
+location='centralindia'
 aks_vnet_name='aks'
 aks_vnet_address='10.0.0.0/8'
 aks_system_subnet_name='AksSubnet'
@@ -19,7 +19,7 @@ az group create --location $location -n $rg -o none
 # AKS Identity
 echo -e "\e[1;36mCreating Managed Identity $aks_name-identity....\e[0m"
 az identity create -g $rg -n $aks_name-identity -o none
-aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv)
+aks_identity_id=$(az identity show -g $rg -n $aks_name-identity --query id -o tsv | tr -d '\r')
 
 # vnets
 echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
@@ -30,19 +30,19 @@ az network vnet subnet create -g $rg -n $aks_appgw_subnet_name --address-prefixe
 appgw_name="appgw"
 echo -e "\e[1;36mCreating Application Gateway $appgw_name....\e[0m"
 az network public-ip create -g $rg -n $appgw_name-pubip --allocation-method Static --sku Standard -o none
-az network application-gateway create -n $appgw_name -g $rg --priority 10 --public-ip-address $appgw_name-pubip --sku Standard_v2 --vnet-name $aks_vnet_name --subnet $aks_appgw_subnet_name --no-wait
+az network application-gateway create -n $appgw_name -g $rg --capacity 1 --sku Standard_v2 --public-ip-address $appgw_name-pubip --sku Standard_v2 --vnet-name $aks_vnet_name --subnet $aks_appgw_subnet_name --priority 100 --no-wait
 
 # log analytics
 echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-logAnalytics....\e[0m"
 az monitor log-analytics workspace create -g $rg -n $aks_name-logAnalytics -o none
-log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv)
-
-sleep 40
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-logAnalytics --query id -o tsv | tr -d '\r')
 
 # aks cluster
-aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv)
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r')
 echo -e "\e[1;36mCreating AKS Cluster $aks_name....\e[0m"
-az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --network-plugin azure --assign-identity $aks_identity_id --node-vm-size Standard_b2ms --vnet-subnet-id $aks_system_subnet_id --service-cidr "10.0.0.0/16" --dns-service-ip "10.0.0.10" --docker-bridge-address "172.17.0.1/16" -o none
+az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --network-plugin azure --assign-identity $aks_identity_id --node-vm-size Standard_B4als_v2 --vnet-subnet-id $aks_system_subnet_id --service-cidr "10.0.0.0/16" --dns-service-ip "10.0.0.10" --docker-bridge-address "172.17.0.1/16" -o none
+
+az provider register --namespace Microsoft.ContainerService --wait
 
 echo -e "\e[1;36mCreating Pod Identity....\e[0m"
 mgmt_idntity_name=agic-pod-identity
@@ -50,31 +50,31 @@ az aks get-credentials -g $rg -n $aks_name
 # Create a managed identity 
 az identity create -g $rg -n $mgmt_idntity_name -o none
 # Obtain clientID for the new managed identity
-identityClientId=$(az identity show -g $rg -n $mgmt_idntity_name --query clientId -o tsv)
+identityClientId=$(az identity show -g $rg -n $mgmt_idntity_name --query clientId -o tsv | tr -d '\r') && echo "Identity Client ID: $identityClientId"
 # Obtain ResourceID for the new managed identity
-identityResourceId=$(az identity show -g $rg -n $mgmt_idntity_name --query id -o tsv)
+identityResourceId=$(az identity show -g $rg -n $mgmt_idntity_name --query id -o tsv | tr -d '\r') && echo "Identity Resource ID: $identityResourceId"
 # Obtain the Subscription ID
-subscriptionId=$(az account show --query 'id' -o tsv)
+subscriptionId=$(az account show --query 'id' -o tsv | tr -d '\r') && echo "Subscription ID: $subscriptionId"
 # Get the App Gateway ID 
-AppgwID=$(az network application-gateway show -g $rg -n  $appgw_name --query id -o tsv)
+AppgwID=$(az network application-gateway show -g $rg -n  $appgw_name --query id -o tsv | tr -d '\r') && echo AppGW ID: $AppgwID
 # Obtain the AKS Node Pool Name
-AKSNodePoolName=$(az aks nodepool list --cluster-name $aks_name -g $rg --query '[].name' -o tsv)
+AKSNodePoolName=$(az aks nodepool list --cluster-name $aks_name -g $rg --query '[].name' -o tsv | tr -d '\r') && echo "AKS Node Pool Name: $AKSNodePoolName"
 # Obtain the AKS Node Pool ID
-AKSNodePoolID=$(az aks nodepool show --cluster-name $aks_name --name $AKSNodePoolName -g $rg --query 'id' -o tsv)
+AKSNodePoolID=$(az aks nodepool show --cluster-name $aks_name --name $AKSNodePoolName -g $rg --query 'id' -o tsv | tr -d '\r') && echo "AKS Node Pool ID: $AKSNodePoolID"
 # Obtain the AKS Kubelet Identity ObjectId
-kubeletidentityobjectId=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.objectId' -o tsv)
+kubeletidentityobjectId=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.objectId' -o tsv | tr -d '\r') && echo "Kubelet Identity ObjectId: $kubeletidentityobjectId"
 # Obtain ResourceID for the Kubelet Identity
-kubeletidentityResourceID=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.resourceId' -o tsv)
+kubeletidentityResourceID=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.resourceId' -o tsv | tr -d '\r') && echo "Kubelet Identity Resource ID: $kubeletidentityResourceID"
 # Obtain ClientID for the Kubelet Identity
-kubeletidentityClientID=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.clientId' -o tsv)
+kubeletidentityClientID=$(az aks show -g $rg -n $aks_name --query 'identityProfile.kubeletidentity.clientId' -o tsv | tr -d '\r') && echo "Kubelet Identity Client ID: $kubeletidentityClientID"
 # Obtain the AKS Node Resource Group
-AKSNodeRG=$(az aks list -g $rg --query '[].nodeResourceGroup' -o tsv)
+AKSNodeRG=$(az aks list -g $rg --query '[].nodeResourceGroup' -o tsv | tr -d '\r') && echo "AKS Node Resource Group: $AKSNodeRG"
 sleep 30
 # Give the identity Contributor access to the Application Gateway
 echo -e "\e[1;36mAssign Contributor role to $mgmt_idntity_name on $appgw_name AppGW and $aks_name resources....\e[0m"
 az role assignment create --role Contributor --assignee $identityClientId --scope $AppgwID -o none
 # Get the Application Gateway resource group ID
-ResourceGroupID=$(az group show -n $rg --query id -o tsv)
+ResourceGroupID=$(az group show -n $rg --query id -o tsv | tr -d '\r') && echo "Resource Group ID: $ResourceGroupID"
 # Give the identity Reader access to the Application Gateway resource group
 az role assignment create --role Contributor --assignee $identityClientId --scope $ResourceGroupID -o none
 # Give the identity Contributor access to the Resource Group
@@ -87,6 +87,10 @@ az role assignment create --assignee $kubeletidentityobjectId  --role "Contribut
 az role assignment create --assignee $kubeletidentityobjectId  --role "Managed Identity Operator" --scope $identityResourceId -o none
 # Deploy an AAD pod identity in an RBAC-enabled cluster (comment line 62 if not using an RBAC-enabled cluster.)
 echo -e "\e[1;36mDeploying an AAD pod identity in $aks_name resources....\e[0m"
+sudo curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin/kubectl
+az aks get-credentials -g $rg -n $aks_name --files ~\.kube\config --debug
 kubectl create -f https://raw.githubusercontent.com/Azure/aad-pod-identity/master/deploy/infra/deployment-rbac.yaml
 
 # Helm AGIC Configuration file
@@ -101,54 +105,57 @@ sed -i "/<applicationGatewayName>/ s//$appgw_name/" helm-agic-config.yaml
 sed -i "s|<identityResourceId>|${identityResourceId}|g" helm-agic-config.yaml
 sed -i "/<identityClientId>/ s//$identityClientId/" helm-agic-config.yaml
 sed -i -e "s|enabled: false # true/false|enabled: true # true/false|" helm-agic-config.yaml
-
+cat helm-agic-config.yaml
 # Installing Helm
 echo -e "\e[1;36mInstalling Helm tool....\e[0m"
 curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
 chmod +x get_helm.sh
 ./get_helm.sh
 
-# Adding AGIC helm repo
-echo -e "\e[1;36mAdding AGIC Helm Repo....\e[0m"
-helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/
-helm repo update
 # Deploying AGIC
 echo -e "\e[1;36mDeploying $appgw_name-agic AppGW Ingress Controller to $aks_name....\e[0m"
-helm upgrade --install $appgw_name-agic -f helm-agic-config.yaml application-gateway-kubernetes-ingress/ingress-azure
+helm install  $appgw_name-agic oci://mcr.microsoft.com/azure-application-gateway/charts/ingress-azure --version 1.8.1 -f helm-agic-config.yaml
+#helm upgrade --install $appgw_name-agic -f helm-agic-config.yaml application-gateway-kubernetes-ingress/ingress-azure
 
 sleep 30
 
-appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv) && echo "$appgw_name: $appgw_pubip"
+appgw_pubip=$(az network public-ip show -g $rg -n $appgw_name-pubip --query ipAddress -o tsv | tr -d '\r') && echo "$appgw_name: $appgw_pubip"
 
-
-#############################
-# App 1  deployed to appgw #
-#############################
+##########
+# APP #1 #
+##########
 echo -e "\e[1;36mDeploying a service on $aks_name with ingress....\e[0m"
 cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: aspnetapp
+  name: nginx-deployment
   labels:
-    app: aspnetapp
+    app: nginx
 spec:
-  containers:
-  - image: "mcr.microsoft.com/dotnet/core/samples:aspnetapp"
-    name: aspnetapp-image
-    ports:
-    - containerPort: 80
-      protocol: TCP
-
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
 ---
 
 apiVersion: v1
 kind: Service
 metadata:
-  name: aspnetapp-svc
+  name: nginx-svc
 spec:
   selector:
-    app: aspnetapp
+    app: nginx
   ports:
   - protocol: TCP
     port: 80
@@ -159,22 +166,28 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: aspnetapp-ing
+  name: nginx-ing
   annotations:
     kubernetes.io/ingress.class: azure/application-gateway
 spec:
   rules:
-  - host: "$appgw_pubip.nip.io"
+  - host: "nginx.$appgw_pubip.nip.io"
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: aspnetapp-svc
+            name: nginx-svc
             port: 
               number: 80
 EOF
 
-echo -e "\e[1;36mTry to access http://$appgw_pubip.nip.io/ ....\e[0m"
-rm helm-agic-config.yaml
+# Debugging
+kubectl get all
+kubectl get deployment,pod,svc,ingress --all-namespaces -o wide
+echo -e "\e[1;36mTry to access http://nginx.$appgw_pubip.nip.io/ ....\e[0m"
+rm helm-agic-config.yaml deployment-rbac.yaml get_helm.sh
+
+# Cleanup
+# az group delete -g $rg --yes --no-wait -o none
