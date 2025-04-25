@@ -486,3 +486,6 @@ az network vnet subnet update -g $rg --vnet-name $aks_vnet_name -n $aks2_subnet_
 
 echo "confirm you are still able to access both apps: http://aks1.$appgw_pubip.nip.io and http://aks2.$appgw_pubip.nip.io"
 echo -e "\e[1;36mConnect to each aks cluster and run the following command to check if the aks subnet is being protected by the Az Firewall: kubectl exec -ti centos -- /bin/bash \nThen run the following command: curl www.cnn.com...\e[0m"
+
+# Cleanup
+# az group delete -g $rg --yes --no-wait -o none

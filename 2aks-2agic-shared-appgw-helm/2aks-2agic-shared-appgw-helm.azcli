@@ -391,3 +391,6 @@ rm aks2app1.yaml #aks2app2.yaml
 az aks command invoke -g $rg -n $aks2_name --command "kubectl get deployment,pod,svc,ingress --all-namespaces -o wide"
 
 echo "confirm you are able to access both apps: http://aks1.$appgw_pubip.nip.io and http://aks2.$appgw_pubip.nip.io"
+
+# Cleanup
+# az group delete -g $rg --yes --no-wait -o none
