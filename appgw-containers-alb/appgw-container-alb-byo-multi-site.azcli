@@ -64,13 +64,13 @@ helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-co
 
 # Verify ALB Controller deployment in AKS
 echo -e "\e[1;36mVerifying deployment of ALB Controller in $aks_name..\e[0m"
-kubectl get all --all-namespaces -o wide
+kubectl get all -n azure-alb-system -o wide
 # kubectl get deployment,pod,svc,ingress --all-namespaces -o wide
-kubectl get gatewayclass azure-alb-external -o yaml
+# kubectl get gatewayclass azure-alb-external -o yaml
 
 # Application Gateway for Containers
 # Application Gateway for Containers ALB
-echo -e "\e[1;36mCreate Application Gateway for Container ALB resource..\e[0m"
+echo -e "\e[1;36mCreating Application Gateway for Container ALB resource..\e[0m"
 az network alb create -g $rg -n $aks_name-alb -o none
 alb_res_id=$(az network alb show -g $rg -n $aks_name-alb --query id -o tsv | tr -d '\r') && echo "ALB Resource ID: $alb_res_id"
 
