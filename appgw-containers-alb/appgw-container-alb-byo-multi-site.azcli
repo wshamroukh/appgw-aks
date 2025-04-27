@@ -178,9 +178,11 @@ spec:
     targetPort: 80
 EOF
 
+# Deploying nginx services
 echo -e "\e[1;36mDeploying ngnix service on $aks_name.\e[0m"
 az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f nginx.yaml" --file nginx.yaml
 rm nginx.yaml
+# Deploying httpd service
 echo -e "\e[1;36mDeploying httpd service on $aks_name.\e[0m"
 az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f httpd.yaml" --file httpd.yaml
 rm httpd.yaml
@@ -210,14 +212,17 @@ spec:
     value: $aks_name-fe
 EOF
 
+# Deploying Gateway API
 az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f gateway.yaml" --file gateway.yaml
 rm gateway.yaml
+
+# verify Gateway API
 kubectl get gateway gateway-01 -n default -o yaml
 
 # Gateway API IP
 gatewayApi_ip=$(dig +short $(kubectl get gateway gateway-01 -n default -o jsonpath='{.status.addresses[0].value}')) && echo "Gateway API IP: $gatewayApi_ip"
 
-# deploying Routes to nginx and httpd services
+# Deploying Routes to nginx and httpd services
 echo -e "\e[1;36mDeploying Routes to nginx and httpd service on $aks_name using gateway-01 API.\e[0m"
 cat <<EOF > routes.yaml
 apiVersion: gateway.networking.k8s.io/v1
