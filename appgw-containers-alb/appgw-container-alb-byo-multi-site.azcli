@@ -28,17 +28,17 @@ az group create --location $location -n $rg -o none
 echo -e "\e[1;36mCreating AKS Identity $aks_name-identity...\e[0m"
 aks_identity_id=$(az identity create --resource-group $rg --name $aks_name-identity --query principalId -o tsv | tr -d '\r') && echo "AKS Identity Principal ID: $aks_identity_id"
 
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-law....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $aks_name-law -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-law --query id -o tsv | tr -d '\r') && echo -e "Log Analytics Workspace ID: $log_analytics_ws_id"
+
 # vnets
 echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
 az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address --subnet-name $aks_system_subnet_name --subnet-prefixes $aks_system_subnet_address -o none
 az network vnet subnet create -g $rg -n $aks_alb_subnet_name --address-prefixes $aks_alb_subnet_address --vnet-name $aks_vnet_name -o none
 aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r') && echo -e "AKS System Subnet ID: $aks_system_subnet_id"
 alb_subnet_id=$(az network vnet subnet show -g $rg -n $aks_alb_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r') && echo "ALB Subnet ID: $alb_subnet_id"
-
-# log analytics
-echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-law....\e[0m"
-az monitor log-analytics workspace create -g $rg -n $aks_name-law -o none
-log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-law --query id -o tsv | tr -d '\r') && echo -e "Log Analytics Workspace ID: $log_analytics_ws_id"
 
 # aks cluster
 echo -e "\e[1;36mCreating AKS Cluster $aks_name....\e[0m"
