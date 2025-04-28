@@ -95,8 +95,9 @@ az role assignment create --assignee-object-id $aks_identity_id --assignee-princ
 echo -e "\e[1;36mCreating association between $aks_name-alb and $aks_alb_subnet_name..\e[0m"
 az network alb association create -g $rg -n $aks_name-assoc --alb-name $aks_name-alb --subnet $alb_subnet_id -o none
 
-# Multi-site hosting with Application Gateway for Containers - Gateway API
-
+#############################################################################
+# Multi-site hosting with Application Gateway for Containers - Gateway API  #
+#############################################################################
 ##########
 # APP #1 #
 ##########
@@ -219,7 +220,8 @@ rm gateway.yaml
 # verify Gateway API
 kubectl get gateway gateway-01 -n default -o yaml
 
-# Gateway API IP
+# Gateway API details
+gatewayApi_fqdn=$(kubectl get gateway gateway-01 -n default -o jsonpath='{.status.addresses[0].value}') && echo "Gateway API FQDN: $gatewayApi_fqdn"
 gatewayApi_ip=$(dig +short $(kubectl get gateway gateway-01 -n default -o jsonpath='{.status.addresses[0].value}')) && echo "Gateway API IP: $gatewayApi_ip"
 
 # Deploying Routes to nginx and httpd services
