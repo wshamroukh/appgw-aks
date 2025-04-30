@@ -1,0 +1,282 @@
+rg='appgw-container-alb-byo'
+location='centralindia'
+aks_vnet_name='aks'
+aks_vnet_address='10.0.0.0/8'
+aks_system_subnet_name='AksSubnet'
+aks_system_subnet_address='10.240.0.0/16'
+aks_alb_subnet_name='alb-subnet'
+aks_alb_subnet_address='10.2.1.0/24'
+aks_name='akscluster'
+
+# run these commands if you have not registered the required providers
+az provider register --namespace Microsoft.ContainerService --wait
+az provider register --namespace Microsoft.Network --wait
+az provider register --namespace Microsoft.NetworkFunction --wait
+az provider register --namespace Microsoft.ServiceNetworking --wait
+
+# Add Application Gateway for Containers ALB Controller extension
+az extension add --name alb
+
+# Install Helm on local machine
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# resource group
+echo -e "\e[1;36mCreating Resource Group $rg....\e[0m"
+az group create --location $location -n $rg -o none
+
+# AKS Identity
+echo -e "\e[1;36mCreating AKS Identity $aks_name-identity...\e[0m"
+aks_identity_id=$(az identity create --resource-group $rg --name $aks_name-identity --query principalId -o tsv | tr -d '\r') && echo "AKS Identity Principal ID: $aks_identity_id"
+
+# log analytics
+echo -e "\e[1;36mCreating Log Analytics Workspace $aks_name-law....\e[0m"
+az monitor log-analytics workspace create -g $rg -n $aks_name-law -o none
+log_analytics_ws_id=$(az monitor log-analytics workspace show -g $rg -n $aks_name-law --query id -o tsv | tr -d '\r') && echo -e "Log Analytics Workspace ID: $log_analytics_ws_id"
+
+# vnets
+echo -e "\e[1;36mCreating VNet $aks_vnet_name....\e[0m"
+az network vnet create -g $rg -n $aks_vnet_name --address-prefixes $aks_vnet_address --subnet-name $aks_system_subnet_name --subnet-prefixes $aks_system_subnet_address -o none
+az network vnet subnet create -g $rg -n $aks_alb_subnet_name --address-prefixes $aks_alb_subnet_address --vnet-name $aks_vnet_name -o none
+aks_system_subnet_id=$(az network vnet subnet show -g $rg -n $aks_system_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r') && echo -e "AKS System Subnet ID: $aks_system_subnet_id"
+alb_subnet_id=$(az network vnet subnet show -g $rg -n $aks_alb_subnet_name --vnet-name $aks_vnet_name --query id -o tsv | tr -d '\r') && echo "ALB Subnet ID: $alb_subnet_id"
+
+# aks cluster
+echo -e "\e[1;36mCreating AKS Cluster $aks_name....\e[0m"
+az aks create -g $rg -n $aks_name --node-count 1 --node-resource-group $rg-$aks_name-nodes --enable-addons "monitoring" --workspace-resource-id $log_analytics_ws_id --enable-oidc-issuer --enable-workload-identity --enable-cluster-autoscaler --min-count 1 --max-count 3 --max-pods 50 --network-plugin azure --node-vm-size Standard_B4als_v2 --generate-ssh-key --vnet-subnet-id $aks_system_subnet_id -o none
+
+# Nodes Resource Group
+echo -e "\e[1;36mGetting AKS Cluster $aks_name nodes resource group details....\e[0m"
+AKSNodeRG=$(az aks show -g $rg -n $aks_name --query nodeResourceGroup -o tsv | tr -d '\r') && echo "AKS Node Resource Group: $AKSNodeRG"
+nodesRgId=$(az group show -n $AKSNodeRG --query id -o tsv | tr -d '\r') && echo "AKS Nodes Resource Group ID: $nodesRgId"
+
+echo -e "\e[1;36mApply Reader role to the AKS managed cluster resource group for the newly provisioned identity...\e[0m"
+az role assignment create --assignee-object-id $aks_identity_id --assignee-principal-type ServicePrincipal --scope $nodesRgId --role "acdd72a7-3385-48ef-bd42-f606fba81ae7" -o none # Reader role
+
+echo -e "\e[1;36mSet up federation with AKS OIDC issuer...\e[0m"
+aksOidc=$(az aks show -n $aks_name -g $rg --query "oidcIssuerProfile.issuerUrl" -o tsv | tr -d '\r') && echo "AKS OIDC Issuer: $aksOidc"
+az identity federated-credential create -g $rg -n "azure-alb-identity" --identity-name $aks_name-identity --issuer $aksOidc --subject "system:serviceaccount:azure-alb-system:alb-controller-sa" -o none
+
+# Deployment of ALB Controller in AKS
+echo -e "\e[1;36mDeploying ALB Controller in $aks_name..\e[0m"
+az aks get-credentials -g $rg -n $aks_name --overwrite-existing
+cp /mnt/c/Users/waddahsh/.kube/config ~/.kube/config
+helm install alb-controller oci://mcr.microsoft.com/application-lb/charts/alb-controller --create-namespace --namespace alb --version 1.5.2 --set albController.namespace=azure-alb-system --set albController.podIdentity.clientID=$(az identity show -g $rg -n $aks_name-identity --query clientId -o tsv | tr -d '\r')
+
+# Verify ALB Controller deployment in AKS
+echo -e "\e[1;36mVerifying deployment of ALB Controller in $aks_name..\e[0m"
+kubectl get all -n azure-alb-system -o wide
+# kubectl get deployment,pod,svc,ingress --all-namespaces -o wide
+# kubectl get gatewayclass azure-alb-external -o yaml
+
+# Application Gateway for Containers
+# Application Gateway for Containers ALB
+echo -e "\e[1;36mCreating Application Gateway for Container ALB resource..\e[0m"
+az network alb create -g $rg -n $aks_name-alb -o none
+alb_res_id=$(az network alb show -g $rg -n $aks_name-alb --query id -o tsv | tr -d '\r') && echo "ALB Resource ID: $alb_res_id"
+
+# Application Gateway for Containers Frontend: Define an entry point for client traffic to your Application Gateway for Containers.
+echo -e "\e[1;36mCreating Frondend for Application Gateway for Container ALB resource..\e[0m"
+az network alb frontend create -g $rg -n $aks_name-fe --alb-name $aks_name-alb -o none
+frontend_ednpoint=$(az network alb show -g $rg -n $aks_name-alb --query configurationEndpoints[] -o tsv | tr -d '\r') && echo "Frontend Endpoint: $frontend_ednpoint"
+
+# Associate ALB with a subnet: Associate your Application Gateway for Containers with a virtual network to start directing traffic to your deployments.
+echo -e "\e[1;36mDelegating Microsoft.ServiceNetworking/trafficControllers to $aks_alb_subnet_name..\e[0m"
+az network vnet subnet update -g $rg -n $aks_alb_subnet_name --vnet-name $aks_vnet_name --delegations 'Microsoft.ServiceNetworking/trafficControllers' -o none
+
+# Delegate permissions to managed identity
+echo -e "\e[1;36mDelegating permissions to $aks_name-identity..\e[0m"
+# Delegate AppGw for Containers Configuration Manager role to RG containing Application Gateway for Containers resource
+rgid=$(az group show --name $rg --query id -otsv | tr -d '\r') && echo "AKS Resource Group ID: $rgid"
+az role assignment create --assignee-object-id $aks_identity_id --assignee-principal-type ServicePrincipal --scope $rgid --role "fbc52c3f-28ad-4303-a892-8a056630b8f1" -o none
+# Delegate Network Contributor permission for join to association subnet
+az role assignment create --assignee-object-id $aks_identity_id --assignee-principal-type ServicePrincipal --scope $alb_subnet_id --role "4d97b98b-1d4f-4787-a291-c67834d212e7" -o none
+
+# Create an association resource: Associate your Application Gateway for Containers with a virtual network to start directing traffic to your deployments.
+echo -e "\e[1;36mCreating association between $aks_name-alb and $aks_alb_subnet_name..\e[0m"
+az network alb association create -g $rg -n $aks_name-assoc --alb-name $aks_name-alb --subnet $alb_subnet_id -o none
+
+#############################################################################
+# Multi-site hosting with Application Gateway for Containers - Gateway API  #
+#############################################################################
+##########
+# APP #1 #
+##########
+cat <<EOF >backend1.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: backend1
+  labels:
+    app: backend1
+spec:
+  containers:
+  - image: jelledruyts/inspectorgadget:latest
+    name: inspectorgadget-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend1-svc
+spec:
+  selector:
+    app: backend1
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend1-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "backend1.$gatewayApi_ip.nip.io"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: backend1-svc
+            port: 
+              number: 80
+EOF
+
+##########
+# APP #2 #
+##########
+cat <<EOF >backend2.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: backend2
+  labels:
+    app: backend2
+spec:
+  containers:
+  - image: jelledruyts/inspectorgadget:latest
+    name: inspectorgadget-image
+    ports:
+    - containerPort: 80
+      protocol: TCP
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend2-svc
+spec:
+  selector:
+    app: backend2
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend2-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: "backend2.$gatewayApi_ip.nip.io"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: backend2-svc
+            port: 
+              number: 80
+EOF
+
+# Deploying backend1 services
+echo -e "\e[1;36mDeploying ngnix service on $aks_name.\e[0m"
+az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f backend1.yaml" --file backend1.yaml
+rm backend1.yaml
+# Deploying backend2 service
+echo -e "\e[1;36mDeploying backend2 service on $aks_name.\e[0m"
+az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f backend2.yaml" --file backend2.yaml
+rm backend2.yaml
+az aks command invoke -g $rg -n $aks_name --command "kubectl get deployment,pod,svc -n default -o wide"
+
+# Create Gateway API
+echo -e "\e[1;36mDeploying Gateway API (gateway-01) on $aks_name.\e[0m"
+cat <<EOF > gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gateway-01
+  namespace: default
+  annotations:
+    alb.networking.azure.io/alb-id: $alb_res_id
+spec:
+  gatewayClassName: azure-alb-external
+  listeners:
+  - name: http-listener
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+  addresses:
+  - type: alb.networking.azure.io/alb-frontend
+    value: $aks_name-fe
+EOF
+
+# Deploying Gateway API
+az aks command invoke -g $rg -n $aks_name --command "kubectl apply -f gateway.yaml" --file gateway.yaml
+rm gateway.yaml
+
+# verify Gateway API
+kubectl get gateway gateway-01 -n default -o yaml
+
+# Gateway API details
+gatewayApi_fqdn=$(kubectl get gateway gateway-01 -n default -o jsonpath='{.status.addresses[0].value}') && echo "Gateway API FQDN: $gatewayApi_fqdn"
+gatewayApi_ip=$(dig +short $(kubectl get gateway gateway-01 -n default -o jsonpath='{.status.addresses[0].value}')) && echo "Gateway API IP: $gatewayApi_ip"
+
+# Deploying Routes to backend1 and backend2 services
+echo -e "\e[1;36mDeploying Routes to backend1 and backend2 service on $aks_name using gateway-01 API.\e[0m"
+cat <<EOF > traffic-split-route.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: traffic-split-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: gateway-01
+  rules:
+  - backendRefs:
+    - name: backend1-svc
+      port: 80
+    - name: backend2-svc
+      port: 80
+EOF
+
+kubectl apply -f traffic-split-route.yaml
+rm traffic-split-route.yaml
+# verify routes
+kubectl get httproute traffic-split-route -n default -o yaml
+kubectl get gateway gateway-01 -n default -o yaml
+kubectl get deployment,pod,svc,httproute,gateway -n default -o wide
+
+echo -e "\e[1;36mTry to acces now http://$gatewayApi_fqdn \e[0m"
+
+# Cleanup
+# az group delete -g $rg --yes --no-wait -o none
+
